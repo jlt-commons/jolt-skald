@@ -1,0 +1,2 @@
+{:paths ["src"]
+ :deps  {io.github.jolt-skald/skald {:local/root ".."}}}

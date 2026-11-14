@@ -1,0 +1,75 @@
+{:paths ["src"]
+
+ ;; The Odin shim, compiled by `jolt native` (see :tasks below).
+ ;; `jolt run` / `jolt repl` load the shared library. `jolt build` links the
+ ;; static archive set instead (shim + SDL3 + stb + an X11 forwarder), so a
+ ;; built binary needs no .so beside it — run `jolt native-static` first, or
+ ;; pass `jolt build --dynamic` to keep loading the shared library.
+ :jolt/native [{:name    "skald_jolt (run `jolt native` to build it)"
+                :darwin  ["native/libskald_jolt.dylib"]
+                :linux   ["native/libskald_jolt.so"]
+                :windows ["native/skald_jolt.dll"]
+                :static  {:archive "native/static/libskald_jolt_all.a"}}]
+
+ :tasks
+ {:requires ([babashka.fs :as fs] [clojure.string :as str])
+  :init (do
+          (def os (str/lower-case (System/getProperty "os.name")))
+          (def lib (cond (str/includes? os "mac") "native/libskald_jolt.dylib"
+                         (str/includes? os "win") "native/skald_jolt.dll"
+                         :else                    "native/libskald_jolt.so"))
+          ;; Where Skald lives: $SKALD_DIR, else the vendored submodule.
+          (def skald (or (System/getenv "SKALD_DIR") "vendor/Skald")))
+
+  native
+  {:doc  "Compile native/skald_jolt (Odin) into the shared library. Needs `odin` on PATH and Skald at $SKALD_DIR or vendor/Skald."
+   :task (do
+           (when-not (fs/exists? (str skald "/skald"))
+             (throw (ex-info (str "Skald not found at " skald
+                                  " — set SKALD_DIR or `git submodule update --init`")
+                             {:skald skald})))
+           (shell "odin" "build" "native/skald_jolt"
+                  "-build-mode:shared"
+                  (str "-collection:gui=" skald)
+                  "-o:speed"
+                  (str "-out:" lib))
+           (println "built:" lib))}
+
+  native-static
+  {:doc  "Build native/static/libskald_jolt_all.a for `jolt build`: the shim, SDL3, Odin's stb libs, an X11 forwarder and the Odin runtime start-up hook in one archive. Linux only for now. Needs SDL3 built as a static library: set SDL3_STATIC_DIR to the directory holding libSDL3.a."
+   :task (let [sdl-dir (or (System/getenv "SDL3_STATIC_DIR")
+                           (throw (ex-info "set SDL3_STATIC_DIR to the directory holding libSDL3.a (SDL built with -DSDL_STATIC=ON)" {})))
+               odin    (str/trim (:out (shell {:out :string} "odin" "root")))
+               stb     (str odin "/vendor/stb/lib")
+               out     "native/static"
+               parts   (concat [(str out "/libskald_jolt.a")
+                                (str out "/libstatic_support.a")
+                                (str sdl-dir "/libSDL3.a")]
+                               ;; (libSDL3.a already contains SDL's uclibc math objects)
+                               (for [n ["stb_image" "stb_image_write" "stb_image_resize2"
+                                        "stb_truetype" "stb_rect_pack"]]
+                                 (str stb "/" n ".a")))]
+           (when-not (fs/exists? (str skald "/skald"))
+             (throw (ex-info (str "Skald not found at " skald) {:skald skald})))
+           (fs/create-dirs out)
+           ;; -no-entry-point: the archive must not bring a C `main`; Jolt's
+           ;; launcher is the program's entry.
+           (shell "odin" "build" "native/skald_jolt" "-build-mode:static" "-no-entry-point"
+                  (str "-collection:gui=" skald) "-o:speed"
+                  (str "-out:" out "/libskald_jolt.a"))
+           ;; static_init.c starts Odin's runtime; x11_dl.c forwards Skald's
+           ;; Xlib calls to a dlopen'd libX11 (see each file's header)
+           (doseq [c ["static_init" "x11_dl"]]
+             (shell "cc" "-O2" "-fPIC" "-c" (str "native/" c ".c") "-o" (str out "/" c ".o")))
+           (shell "ar" "rcs" (str out "/libstatic_support.a")
+                  (str out "/static_init.o") (str out "/x11_dl.o"))
+           (doseq [p parts]
+             (when-not (fs/exists? p) (throw (ex-info (str "missing archive: " p) {:path p}))))
+           ;; merge with an ar MRI script so same-named members from different
+           ;; archives don't overwrite each other
+           (spit (str out "/merge.mri")
+                 (str "create " out "/libskald_jolt_all.a\n"
+                      (apply str (for [p parts] (str "addlib " p "\n")))
+                      "save\nend\n"))
+           (shell {:in (slurp (str out "/merge.mri"))} "ar" "-M")
+           (println "built:" (str out "/libskald_jolt_all.a")))}}}

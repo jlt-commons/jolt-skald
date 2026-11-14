@@ -1,0 +1,11 @@
+native/*.so
+native/*.dylib
+native/*.dll
+native/*.o
+native/*.lib
+native/*.exp
+.cpcache/
+.nrepl-port
+.jolt/
+native/static/
+test/mac/bin/
